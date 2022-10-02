@@ -9,7 +9,6 @@ import (
 	cryptoenc "github.com/tendermint/tendermint/crypto/encoding"
 	"github.com/tendermint/tendermint/libs/fail"
 	"github.com/tendermint/tendermint/libs/log"
-	mempl "github.com/tendermint/tendermint/mempool"
 	tmstate "github.com/tendermint/tendermint/proto/tendermint/state"
 	tmproto "github.com/tendermint/tendermint/proto/tendermint/types"
 	"github.com/tendermint/tendermint/proxy"
@@ -33,11 +32,6 @@ type BlockExecutor struct {
 	// events
 	eventBus types.BlockEventPublisher
 
-	// manage the mempool lock during commit
-	// and update both with block results after commit.
-	mempool mempl.Mempool
-	evpool  state.EvidencePool
-
 	logger log.Logger
 
 	metrics *state.Metrics
@@ -54,21 +48,17 @@ func BlockExecutorWithMetrics(metrics *state.Metrics) BlockExecutorOption {
 // NewBlockExecutor returns a new BlockExecutor with a NopEventBus.
 // Call SetEventBus to provide one.
 func NewBlockExecutor(
-	stateStore Store,
+	stateStore state.Store,
 	logger log.Logger,
 	proxyApp proxy.AppConnConsensus,
-	mempool mempl.Mempool,
-	evpool EvidencePool,
 	options ...BlockExecutorOption,
 ) *BlockExecutor {
 	res := &BlockExecutor{
 		store:    stateStore,
 		proxyApp: proxyApp,
 		eventBus: types.NopEventBus{},
-		mempool:  mempool,
-		evpool:   evpool,
 		logger:   logger,
-		metrics:  NopMetrics(),
+		metrics:  state.NopMetrics(),
 	}
 
 	for _, option := range options {
@@ -86,86 +76,6 @@ func (blockExec *BlockExecutor) Store() state.Store {
 // If not called, it defaults to types.NopEventBus.
 func (blockExec *BlockExecutor) SetEventBus(eventBus types.BlockEventPublisher) {
 	blockExec.eventBus = eventBus
-}
-
-// CreateProposalBlock calls state.MakeBlock with evidence from the evpool
-// and txs from the mempool. The max bytes must be big enough to fit the commit.
-// Up to 1/10th of the block space is allcoated for maximum sized evidence.
-// The rest is given to txs, up to the max gas.
-//
-// Contract: application will not return more bytes than are sent over the wire.
-func (blockExec *BlockExecutor) CreateProposalBlock(
-	height int64,
-	state state.State, commit *types.Commit,
-	proposerAddr []byte,
-) (*types.Block, *types.PartSet) {
-
-	maxBytes := state.ConsensusParams.Block.MaxBytes
-	maxGas := state.ConsensusParams.Block.MaxGas
-
-	evidence, evSize := blockExec.evpool.PendingEvidence(state.ConsensusParams.Evidence.MaxBytes)
-
-	evdData := types.EvidenceData{Evidence: evidence}
-	pevdData, err := evdData.ToProto()
-	if err != nil {
-		// todo(evan): see if we can get rid of this panic
-		panic(err)
-	}
-
-	// Fetch a limited amount of valid txs
-	maxDataBytes := types.MaxDataBytes(maxBytes, evSize, state.Validators.Size())
-
-	// TODO(ismail): reaping the mempool has to happen in relation to a max
-	// allowed square size instead of (only) Gas / bytes
-	// maybe the mempool actually should track things separately
-	// meaning that CheckTx should already do the mapping:
-	// Tx -> Txs, Message
-	// https://github.com/tendermint/tendermint/issues/77
-	txs := blockExec.mempool.ReapMaxBytesMaxGas(maxDataBytes, maxGas)
-	l := len(txs)
-	bzs := make([][]byte, l)
-	for i := 0; i < l; i++ {
-		bzs[i] = txs[i]
-	}
-
-	preparedProposal, err := blockExec.proxyApp.PrepareProposalSync(
-		abci.RequestPrepareProposal{
-			BlockData:     &tmproto.Data{Txs: txs.ToSliceOfBytes(), Evidence: *pevdData},
-			BlockDataSize: maxDataBytes},
-	)
-	if err != nil {
-		// The App MUST ensure that only valid (and hence 'processable') transactions
-		// enter the mempool. Hence, at this point, we can't have any non-processable
-		// transaction causing an error.
-		//
-		// Also, the App can simply skip any transaction that could cause any kind of trouble.
-		// Either way, we can not recover in a meaningful way, unless we skip proposing
-		// this block, repair what caused the error and try again. Hence, we panic on
-		// purpose for now.
-		panic(err)
-	}
-	rawNewData := preparedProposal.GetBlockData()
-	var txSize int
-	for _, tx := range rawNewData.GetTxs() {
-		txSize += len(tx)
-
-		if maxDataBytes < int64(txSize) {
-			panic("block data exceeds max amount of allowed bytes")
-		}
-	}
-
-	newData, err := types.DataFromProto(rawNewData)
-	if err != nil {
-		// todo(evan): see if we can get rid of this panic
-		panic(err)
-	}
-
-	return state.MakeBlock(
-		height,
-		newData,
-		commit,
-		proposerAddr,
-	)
 }
 
 func (blockExec *BlockExecutor) ProcessProposal(
@@ -193,12 +103,8 @@ func (blockExec *BlockExecutor) ProcessProposal(
 // If the block is invalid, it returns an error.
 // Validation does not mutate state, but does require historical information from the stateDB,
 // ie. to verify evidence from a validator at an old height.
-func (blockExec *BlockExecutor) ValidateBlock(state state.State, block *types.Block) error {
-	err := validateBlock(state, block)
-	if err != nil {
-		return err
-	}
-	return blockExec.evpool.CheckEvidence(block.Evidence.Evidence)
+func (blockExec *BlockExecutor) ValidateBlock(s state.State, block *types.Block) error {
+	return validateBlock(s, block)
 }
 
 // ApplyBlock validates the block against the state, executes it against the app,
@@ -217,7 +123,7 @@ func (blockExec *BlockExecutor) ApplyBlock(
 
 	startTime := time.Now().UnixNano()
 	abciResponses, err := execBlockOnProxyApp(
-		blockExec.logger, blockExec.proxyApp, block, blockExec.store, state.InitialHeight,
+		blockExec.logger, blockExec.proxyApp, block, blockExec.store, s.InitialHeight,
 	)
 	endTime := time.Now().UnixNano()
 	blockExec.metrics.BlockProcessingTime.Observe(float64(endTime-startTime) / 1000000)
@@ -261,9 +167,6 @@ func (blockExec *BlockExecutor) ApplyBlock(
 		return s, 0, fmt.Errorf("commit failed for application: %v", err)
 	}
 
-	// Update evpool with the latest state.
-	blockExec.evpool.Update(s, block.Evidence.Evidence)
-
 	fail.Fail() // XXX
 
 	// Update the app hash and save the state.
@@ -292,17 +195,6 @@ func (blockExec *BlockExecutor) Commit(
 	block *types.Block,
 	deliverTxResponses []*abci.ResponseDeliverTx,
 ) ([]byte, int64, error) {
-	blockExec.mempool.Lock()
-	defer blockExec.mempool.Unlock()
-
-	// while mempool is Locked, flush to ensure all async requests have completed
-	// in the ABCI app before Commit.
-	err := blockExec.mempool.FlushAppConn()
-	if err != nil {
-		blockExec.logger.Error("client error during mempool.FlushAppConn", "err", err)
-		return nil, 0, err
-	}
-
 	// Commit block, get hash back
 	res, err := blockExec.proxyApp.CommitSync()
 	if err != nil {
@@ -316,15 +208,6 @@ func (blockExec *BlockExecutor) Commit(
 		"height", block.Height,
 		"num_txs", len(block.Txs),
 		"app_hash", fmt.Sprintf("%X", res.Data),
-	)
-
-	// Update mempool.
-	err = blockExec.mempool.Update(
-		block.Height,
-		block.Txs,
-		deliverTxResponses,
-		state.TxPreCheck(s),
-		state.TxPostCheck(s),
 	)
 
 	return res.Data, res.RetainHeight, err
